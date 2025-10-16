@@ -4,7 +4,7 @@
 * Join [discord server](https://discord.gg/mQhghxCRJU) if you want to collaborate on this repo or have any questions.
 * **Be responsible, considerate, and think about the maintainers of the ecourts website. Avoid scraping with high concurrency.**
 * **track.json** is broken and not working as expected.
-* Last updated at 9th September, 2025.
+* **Last updated at 9th October, 2025**.
 
 
 # Indian Court Judgments Downloader

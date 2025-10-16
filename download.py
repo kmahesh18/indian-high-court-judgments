@@ -271,7 +271,12 @@ def get_bench_codes():
 
 
 def get_court_dates_from_index_files():
-    """Get updated_at dates from data index files"""
+    """
+    Get updated_at dates from data index files.
+    
+    NOTE: Currently only checks current year. For multi-year sync, this would need
+    to be updated to check all years or accept a year parameter.
+    """
     # return {'20_7': {'jhar_pg': '2025-05-05T00:00:00'}}  # For testing, return fixed data
     if not S3_AVAILABLE:
         print("[ERROR] S3 not available")
@@ -279,7 +284,7 @@ def get_court_dates_from_index_files():
     
     s3 = boto3.client('s3', config=Config(signature_version=UNSIGNED))
     
-    year = datetime.now().year
+    year = datetime.now().year  # TODO: Support multi-year sync
     prefix = f"data/tar/year={year}/"
     
     print(f"Reading dates from data index files: {S3_BUCKET}/{prefix}")
@@ -342,12 +347,15 @@ def get_existing_files_from_s3(court_code, benches):
     """
     Fetch existing filenames from S3 index files for all benches of a court.
     Returns a dict: {bench_name: {'metadata': set(), 'data': set()}}
+    
+    NOTE: Currently only checks current year. For multi-year support, this would need
+    to be updated to check all years or accept a year parameter.
     """
     if not S3_AVAILABLE:
         return {}
     
     s3 = boto3.client('s3', config=Config(signature_version=UNSIGNED))
-    year = datetime.now().year
+    year = datetime.now().year  # TODO: Support multi-year queries
     
     existing_files = {}
     
@@ -394,8 +402,17 @@ def get_existing_files_from_s3(court_code, benches):
     return existing_files
 
 
-def update_index_files_after_download(court_code, bench, new_files, to_date=None):
-    """Update both metadata and data index files with new download information"""
+def update_index_files_after_download(court_code, bench, new_files, to_date=None, year=None):
+    """
+    Update both metadata and data index files with new download information
+    
+    Args:
+        court_code: Court code
+        bench: Bench name
+        new_files: Dict with 'metadata' and 'data' file lists
+        to_date: Date to use for updated_at timestamp
+        year: Year for partitioning (if None, will be extracted from first metadata file or use current year)
+    """
     print("TO_DATE from index.json updater : ", to_date)
     if not S3_AVAILABLE:
         print("[ERROR] S3 not available")
@@ -404,7 +421,13 @@ def update_index_files_after_download(court_code, bench, new_files, to_date=None
     s3_client = boto3.client('s3')
     s3_unsigned = boto3.client('s3', config=Config(signature_version=UNSIGNED))
     
-    year = datetime.now().year
+    # Extract year from first metadata file if not provided
+    if year is None:
+        if new_files.get('metadata'):
+            year = extract_year_from_metadata(new_files['metadata'][0])
+        else:
+            year = datetime.now().year
+    
     # Use to_date if provided, otherwise use current time
     if to_date:
         if isinstance(to_date, str):
@@ -1334,23 +1357,24 @@ def upload_files_to_s3(court_code, downloaded_files):
         return {}  # Empty dict means no benches to upload
     
     s3_client = boto3.client('s3')
-    current_time = datetime.now()
-    year = current_time.year
     
     print(f"Starting S3 upload for court {court_code}")
     print(f"Files to upload: {len(downloaded_files['metadata'])} metadata, {len(downloaded_files['data'])} data files")
     
-    # Extract bench from file paths and organize by bench
-    bench_files = {}
+    # Organize files by BOTH bench AND year (extracted from decision_date)
+    bench_year_files = {}  # {(bench, year): {'metadata': [], 'data': []}}
     
-    # Process metadata files
+    # Process metadata files - extract bench and decision year
     failed_metadata = 0
     for metadata_file in downloaded_files['metadata']:
         bench = extract_bench_from_path(metadata_file)
+        year = extract_year_from_metadata(metadata_file)  # Extract from decision_date, NOT current year
+        
         if bench:
-            if bench not in bench_files:
-                bench_files[bench] = {'metadata': [], 'data': []}
-            bench_files[bench]['metadata'].append(metadata_file)
+            key = (bench, year)
+            if key not in bench_year_files:
+                bench_year_files[key] = {'metadata': [], 'data': []}
+            bench_year_files[key]['metadata'].append(metadata_file)
         else:
             failed_metadata += 1
             if failed_metadata <= 3:  # Show first few failures
@@ -1359,14 +1383,23 @@ def upload_files_to_s3(court_code, downloaded_files):
     if failed_metadata > 0:
         print(f"Warning: {failed_metadata} metadata files failed bench extraction")
     
-    # Process data files  
+    # Process data files - match with corresponding metadata to get year
     failed_data = 0
     for data_file in downloaded_files['data']:
         bench = extract_bench_from_path(data_file)
+        
+        # Find corresponding metadata file to extract year
+        metadata_file = str(data_file).replace('.pdf', '.json')
+        if os.path.exists(metadata_file):
+            year = extract_year_from_metadata(metadata_file)
+        else:
+            year = datetime.now().year  # Fallback if metadata not found
+        
         if bench:
-            if bench not in bench_files:
-                bench_files[bench] = {'metadata': [], 'data': []}
-            bench_files[bench]['data'].append(data_file)
+            key = (bench, year)
+            if key not in bench_year_files:
+                bench_year_files[key] = {'metadata': [], 'data': []}
+            bench_year_files[key]['data'].append(data_file)
         else:
             failed_data += 1
             if failed_data <= 3:  # Show first few failures
@@ -1375,16 +1408,16 @@ def upload_files_to_s3(court_code, downloaded_files):
     if failed_data > 0:
         print(f"Warning: {failed_data} data files failed bench extraction")
     
-    # Show final counts by bench
-    print(f"Organized files by bench:")
-    for bench_name, files in bench_files.items():
-        print(f"  {bench_name}: {len(files['metadata'])} metadata, {len(files['data'])} data")
+    # Show final counts by bench and year
+    print(f"Organized files by bench and year:")
+    for (bench_name, year), files in bench_year_files.items():
+        print(f"  {bench_name} (year={year}): {len(files['metadata'])} metadata, {len(files['data'])} data")
     
     bench_upload_status = {}  # Track success per bench
     
-    # Upload files by bench
-    for bench, files in bench_files.items():
-        print(f"Processing bench: {bench}")
+    # Upload files by (bench, year) combination
+    for (bench, year), files in bench_year_files.items():
+        print(f"Processing bench: {bench}, year: {year}")
         
         bench_success = True  # Track this bench's upload success
         
@@ -1910,6 +1943,46 @@ def extract_bench_from_path(file_path):
     except (ValueError, IndexError):
         pass
     return None
+
+
+def extract_year_from_metadata(metadata_file):
+    """
+    Extract decision year from metadata file.
+    Returns the year from the decision_date field in the raw_html.
+    Falls back to current year if extraction fails.
+    """
+    try:
+        with open(metadata_file, 'r') as f:
+            metadata = json.load(f)
+            
+        if 'raw_html' not in metadata:
+            return datetime.now().year
+            
+        html = LH.fromstring(metadata['raw_html'])
+        
+        # Try to extract decision date from the HTML
+        try:
+            decision_date_elems = html.xpath('.//span[contains(text(), "Decision Date")]/following-sibling::font/text()')
+            if decision_date_elems:
+                decision_date_str = decision_date_elems[0].strip()
+                
+                if decision_date_str:
+                    # Try DD-MM-YYYY format (Indian standard)
+                    parts = decision_date_str.split('-')
+                    if len(parts) == 3:
+                        # Year is the last part in DD-MM-YYYY format
+                        year = int(parts[2])
+                        # Sanity check: year should be reasonable
+                        if year <= datetime.now().year + 1:
+                            return year
+        except (IndexError, ValueError, AttributeError):
+            pass
+            
+    except Exception as e:
+        logger.debug(f"Error extracting year from {metadata_file}: {e}")
+    
+    # Fallback to current year
+    return datetime.now().year
 
 
 def upload_single_file_to_s3(s3_client, local_file_path, court_code, bench, year, file_type):
